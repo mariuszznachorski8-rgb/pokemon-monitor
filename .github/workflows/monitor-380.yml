@@ -1,0 +1,216 @@
+name: Monitor ETB do 380 zl
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '2-57/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pokemon-monitor-380
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Odtworz historie alertow
+        uses: actions/cache/restore@v4
+        with:
+          path: monitor-state
+          key: pokemon-380-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: pokemon-380-v1-
+      - name: Sprawdz ceny i dostepnosc
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: python
+        run: |
+          import json, os, re, urllib.request, urllib.error, urllib.parse, unicodedata
+          from pathlib import Path
+          from decimal import Decimal, InvalidOperation
+          from concurrent.futures import ThreadPoolExecutor
+          from html.parser import HTMLParser
+          from datetime import datetime, timezone
+          
+          LIMIT = Decimal('380')
+          SHOPS = [
+              ('Empik', 'https://www.empik.com/szukaj/produkt?q=pokemon%2030th', 'blocked'),
+              ('Media Expert', 'https://www.mediaexpert.pl/search?query%5Bquerystring%5D=pokemon%2030th', 'blocked'),
+              ('Boska Paczka', 'https://www.boskapaczka.pl/products/preorder-pokemon-tcg-30th-celebration-elite-trainer-box', 'product'),
+              ('RGFK', 'https://rgfk.pl/pokemon-tcg-30th-celebration-elite-trainer-box/67576.html', 'product'),
+              ('BoosterPoint', 'https://boosterpoint.pl/produkt/pokemon-tcg-30th-celebration-elite-trainer-box/', 'product'),
+              ('Ataf', 'https://www.ataf.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/9949', 'product'),
+              ('PokeLab', 'https://poke-lab.pl/products/pokemon-tcg-30th-celebration-elite-trainer-box', 'product'),
+              ('Kartexpol', 'https://www.kartexpol.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/310', 'product'),
+              ('Kartomaniak', 'https://kartomaniak.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/286', 'product'),
+              ('CardDojo', 'https://carddojo.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box-ETB/2053', 'product'),
+              ('Kraina Kostek', 'https://krainakostek.pl/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box-p1418', 'product'),
+              ('Arena', 'https://arena-sklep.pl/pokemon-day-2026-30th-anniversary/6207-pokemon-tcg-30th-celebration-elite-trainer-box.html', 'product'),
+              ('TCGLOVE', 'https://www.tcglove.pl/pokemon-tcg-30th-celebration-elite-trainer-box', 'product'),
+              ('PikaTube', 'https://pikatube.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/1879', 'product'),
+              ('Jigglypack', 'https://www.jigglypack.pl/sklep/', 'discovery'),
+              ('Kartomat', 'https://kartomat.sklep.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/206', 'product'),
+              ('Poke Elite', 'https://pokeelite.pl/pokmon-tcg-30th-celebration-elite-trainer-box-p-181.html', 'product'),
+              ('Grymel', 'https://grymel.pl/pokemon-company-international/21285-pokemon-tcg-30th-celebration-elite-trainer-box.html', 'product'),
+              ('3trolle', 'https://3trolle.pl/38128-pokemon-tcg-30th-celebration-elite-trainer-box-limit-2-szt-na-osobefirme.html', 'product'),
+              ('Xjoy', 'https://www.xjoy.pl/811-pokemon-30th-celebration', 'discovery'),
+          ]
+          
+          def norm(s):
+              return ''.join(c for c in unicodedata.normalize('NFKD', str(s).lower()) if not unicodedata.combining(c))
+          def target(name):
+              s=norm(name)
+              return 'pokemon' in s and '30th' in s and 'celebration' in s and ('elite trainer box' in s or re.search(r'\betb\b',s)) and not re.search(r'\b[2-9]\s*x\b|pokemon center',s)
+          def typ(x):
+              return str(x).rstrip('/').rsplit('/',1)[-1]
+          class Node:
+              def __init__(self,tag='',attrs=()): self.tag=tag;self.a=dict(attrs);self.children=[];self.text=''
+              def all(self):
+                  yield self
+                  for c in self.children: yield from c.all()
+              def value(self): return self.a.get('content',self.a.get('href',self.text)).strip()
+          class Page(HTMLParser):
+              def __init__(self): super().__init__();self.root=Node();self.stack=[self.root]
+              def handle_starttag(self,t,a):
+                  n=Node(t,a);self.stack[-1].children.append(n)
+                  if t not in ('area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'):self.stack.append(n)
+              def handle_endtag(self,t):
+                  for i in range(len(self.stack)-1,0,-1):
+                      if self.stack[i].tag==t:self.stack=self.stack[:i];break
+              def handle_data(self,s):
+                  for n in self.stack:n.text+=s
+          
+          def objects(x):
+              if isinstance(x,dict):
+                  yield x
+                  for v in x.values():yield from objects(v)
+              elif isinstance(x,list):
+                  for v in x:yield from objects(v)
+          def merge(a,b):
+              for k,v in b.items():
+                  if isinstance(v,dict) and isinstance(a.get(k),dict):merge(a[k],v)
+                  elif v is not None:a[k]=v
+              return a
+          
+          def parse(html,url):
+              page=Page();page.feed(html);nodes=list(page.root.all())
+              title=next((n.text for n in nodes if n.tag=='title'),'')
+              if any(x in norm(title) for x in ['just a moment','access denied','captcha']):raise ValueError('blokada strony')
+              docs=[]
+              for n in nodes:
+                  if n.tag=='script' and n.a.get('type')=='application/ld+json':
+                      try:docs.append(json.loads(n.text))
+                      except ValueError:pass
+              # Merge fragmented Shoper product descriptions only at document/graph level.
+              top=[]
+              for d in docs:
+                  top.extend(d if isinstance(d,list) else d.get('@graph',[d]) if isinstance(d,dict) else [])
+              grouped={};plain=[]
+              for d in top:
+                  if not isinstance(d,dict):continue
+                  if d.get('@id'):merge(grouped.setdefault(d['@id'],{}),d)
+                  else:plain.append(d)
+              products=[p for d in list(grouped.values())+plain for p in objects(d) if typ(p.get('@type'))=='Product']
+              # Read microdata within each individual product/offer scope.
+              for root in nodes:
+                  if typ(root.a.get('itemtype'))!='Product':continue
+                  subs=list(root.all());name=next((n.value() for n in subs if n.a.get('itemprop')=='name'),'')
+                  offers=[]
+                  for offer in subs:
+                      if typ(offer.a.get('itemtype'))!='Offer':continue
+                      obj={}
+                      for n in offer.all():
+                          prop=n.a.get('itemprop')
+                          if prop in ('price','priceCurrency','availability'):obj.setdefault(prop,n.value())
+                      offers.append(obj)
+                  products.append({'name':name,'offers':offers})
+              output=[]
+              for p in products:
+                  if not target(p.get('name','')):continue
+                  offers=p.get('offers',[]);offers=offers if isinstance(offers,list) else [offers]
+                  for o in offers:
+                      if not isinstance(o,dict) or 'price' not in o:continue
+                      if re.search(r'\b[2-9]\s*x\b',norm(o.get('name',''))):continue
+                      try:price=Decimal(str(o['price']).replace('\xa0','').replace(' ','').replace(',','.'))
+                      except InvalidOperation:continue
+                      currency=str(o.get('priceCurrency','')).upper();avail=typ(o.get('availability',''))
+                      if not price.is_finite() or price<=0 or not currency or not avail:continue
+                      link=urllib.parse.urljoin(url,o.get('url') or url)
+                      if urllib.parse.urlparse(link).hostname!=urllib.parse.urlparse(url).hostname:continue
+                      output.append({'name':p['name'],'price':str(price),'currency':currency,'availability':avail,'url':link,'preorder':avail in ('PreOrder','PreSale','BackOrder') or any(x in norm(title+' '+p['name']) for x in ['preorder','przedsprzedaz'])})
+              return output,page
+          
+          def fetch(url):
+              req=urllib.request.Request(url,headers={'User-Agent':'PokemonMonitor/0.1 (personal product availability check)','Accept-Language':'pl-PL,pl;q=0.9'})
+              with urllib.request.urlopen(req,timeout=25) as r:
+                  raw=r.read(4000001)
+                  if len(raw)>4000000:raise ValueError('strona za duza')
+                  return raw.decode(r.headers.get_content_charset() or 'utf-8',errors='replace')
+          
+          def inspect(shop):
+              name,url,mode=shop
+              if mode=='blocked':return name,[], 'POMINIETY: poprzednio HTTP 403'
+              try:
+                  html=fetch(url);offers,page=parse(html,url)
+                  if mode=='discovery':
+                      links=[]
+                      for n in page.root.all():
+                          href=n.a.get('href','');link=urllib.parse.urljoin(url,href).split('?',1)[0].split('#',1)[0]
+                          if n.tag=='a' and target(urllib.parse.unquote(link).replace('-',' ')) and urllib.parse.urlparse(link).hostname==urllib.parse.urlparse(url).hostname and link not in links:links.append(link)
+                      if not links:return name,[],'NIEZWERYFIKOWANY: nie znaleziono linku ETB'
+                      offers=[]
+                      for link in links[:3]:offers.extend(parse(fetch(link),link)[0])
+                  if not offers:return name,[],'NIEZWERYFIKOWANY: brak pelnych danych ceny/dostepnosci'
+                  return name,offers,'OK: odczytano cene i status'
+              except urllib.error.HTTPError as e:return name,[],'BLAD HTTP '+str(e.code)
+              except Exception as e:return name,[],'BLAD: '+type(e).__name__
+          
+          def qualifies(o):
+              return o['currency']=='PLN' and Decimal(o['price'])<=LIMIT and o['availability'] in ('InStock','LimitedAvailability','PreOrder','PreSale','BackOrder')
+          def send(text):
+              token=os.environ['TELEGRAM_BOT_TOKEN'];chat=os.environ['TELEGRAM_CHAT_ID']
+              if not chat.isdecimal() or int(chat)<=0:raise SystemExit('Niepoprawny TELEGRAM_CHAT_ID')
+              req=urllib.request.Request('https://api.telegram.org/bot'+token+'/sendMessage',data=json.dumps({'chat_id':chat,'text':text,'disable_web_page_preview':True}).encode(),headers={'Content-Type':'application/json'})
+              try:
+                  with urllib.request.urlopen(req,timeout=20) as r:
+                      if not json.load(r).get('ok'):raise ValueError()
+              except Exception:raise SystemExit('Blad wysylki Telegram; sprawdz sekrety i logi testu.') from None
+          
+          def main():
+              path=Path('monitor-state/state.json');path.parent.mkdir(exist_ok=True)
+              try:state=json.loads(path.read_text())
+              except (OSError,ValueError):state={}
+              today=datetime.now(timezone.utc).date().isoformat()
+              with ThreadPoolExecutor(max_workers=4) as pool:results=list(pool.map(inspect,SHOPS))
+              errors=[];ok=0;matched=0
+              for name,offers,status in results:
+                  print(name+': '+status)
+                  if not status.startswith('OK'):errors.append(name+': '+status);continue
+                  ok+=1;previous=state.get(name,{})
+                  selected=[o for o in offers if qualifies(o)];matched+=bool(selected)
+                  current={o['url']:o['price'] for o in selected}
+                  changed=[o for o in selected if o['url'] not in previous or Decimal(o['price'])<Decimal(previous[o['url']])]
+                  if changed:
+                      o=min(changed,key=lambda x:Decimal(x['price']))
+                      label='PRZEDSPRZEDAZ / NA ZAMOWIENIE' if o['preorder'] else 'DOSTEPNOSC WG SKLEPU (sprawdz termin wysylki)'
+                      send('ETB DO 380 ZL\n'+name+'\n'+o['name']+'\nCena: '+o['price']+' PLN + dostawa\n'+label+'\n'+o['url'])
+                  state[name]=current
+                  path.write_text(json.dumps(state,ensure_ascii=False))
+              manual=os.environ.get('GITHUB_EVENT_NAME')=='workflow_dispatch'
+              if state.get('_report')!=today or manual:
+                  report=f'Pokemon Monitor: limit 380 zl + dostawa.\nPelny odczyt: {ok}/{len(SHOPS)} sklepow.\nOferty spelniajace warunki: {matched} sklepow.\n'
+                  if errors:report+='\nWymagaja uwagi:\n'+'\n'.join(errors)
+                  report+='\n\nPrzedsprzedaz wlaczona. Brak odczytu NIE oznacza braku produktu. Bot wysyla linki, nie rezerwuje i nie kupuje.'
+                  send(report[:4000]);state['_report']=today
+              path.write_text(json.dumps(state,ensure_ascii=False))
+          if __name__=='__main__':main()
+      - name: Zapisz historie alertow
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: monitor-state
+          key: pokemon-380-v1-${{ github.run_id }}-${{ github.run_attempt }}
