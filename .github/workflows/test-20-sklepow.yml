@@ -1,0 +1,130 @@
+name: Test 20 sklepow
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Sprawdz 20 sklepow
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from html.parser import HTMLParser
+          from concurrent.futures import ThreadPoolExecutor
+
+          class Page(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.title = ''
+                  self.in_title = False
+                  self.skip = 0
+                  self.parts = []
+                  self.links = []
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  if tag == 'title':
+                      self.in_title = True
+                  if tag in ('script', 'style'):
+                      self.skip += 1
+                  if tag == 'a' and attrs.get('href'):
+                      self.links.append(attrs['href'])
+              def handle_endtag(self, tag):
+                  if tag == 'title':
+                      self.in_title = False
+                  if tag in ('script', 'style'):
+                      self.skip = max(0, self.skip - 1)
+              def handle_data(self, data):
+                  if self.in_title:
+                      self.title += data
+                  if not self.skip:
+                      self.parts.append(data)
+
+          shops = [('Empik - wyszukiwarka', 'https://www.empik.com/szukaj/produkt?q=pokemon%2030th'), ('Media Expert - wyszukiwarka', 'https://www.mediaexpert.pl/search?query%5Bquerystring%5D=pokemon%2030th'), ('Boska Paczka - wyszukiwarka', 'https://www.boskapaczka.pl/search?q=30th%20Celebration'), ('RGFK - ETB', 'https://rgfk.pl/pokemon-tcg-30th-celebration-elite-trainer-box/67576.html'), ('BoosterPoint - ETB', 'https://boosterpoint.pl/produkt/pokemon-tcg-30th-celebration-elite-trainer-box/'), ('Ataf - ETB', 'https://www.ataf.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/9949'), ('PokeLab - ETB', 'https://poke-lab.pl/products/pokemon-tcg-30th-celebration-elite-trainer-box'), ('Kartexpol - ETB', 'https://www.kartexpol.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/310'), ('Kartomaniak - ETB', 'https://kartomaniak.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/286'), ('CardDojo - ETB', 'https://carddojo.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box-ETB/2053'), ('Kraina Kostek - ETB', 'https://krainakostek.pl/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box-p1418'), ('Arena - ETB', 'https://arena-sklep.pl/pokemon-day-2026-30th-anniversary/6207-pokemon-tcg-30th-celebration-elite-trainer-box.html'), ('TCGLOVE - ETB', 'https://www.tcglove.pl/pokemon-tcg-30th-celebration-elite-trainer-box'), ('PikaTube - ETB', 'https://pikatube.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/1879'), ('Mentastore - ETB', 'https://www.mentastore.com/pl/products/pokemon-30th-celebration-elite-trainer-box-eng'), ('Kartomat - ETB', 'https://kartomat.sklep.pl/pl/p/Pokemon-TCG-30th-Celebration-Elite-Trainer-Box/206'), ('Poke Elite - ETB', 'https://pokeelite.pl/pokmon-tcg-30th-celebration-elite-trainer-box-p-181.html'), ('Grymel - ETB', 'https://grymel.pl/pokemon-company-international/21285-pokemon-tcg-30th-celebration-elite-trainer-box.html'), ('3trolle - ETB', 'https://3trolle.pl/38128-pokemon-tcg-30th-celebration-elite-trainer-box-limit-2-szt-na-osobefirme.html'), ('Xjoy - kategoria serii', 'https://www.xjoy.pl/811-pokemon-30th-celebration')]
+
+          def inspect(shop):
+              name, url = shop
+              try:
+                  request = urllib.request.Request(url, headers={
+                      'User-Agent': 'PokemonMonitor/0.1 (personal product availability check)',
+                      'Accept': 'text/html',
+                      'Accept-Language': 'pl-PL,pl;q=0.9',
+                  })
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      raw = response.read(4000001)
+                      if len(raw) > 4000000:
+                          return name, 'odpowiedz przekracza limit testu', {}
+                      source = raw.decode(response.headers.get_content_charset() or 'utf-8', errors='replace')
+                      final_url = response.url
+                  page = Page()
+                  page.feed(source)
+                  visible = re.sub(r'\s+', ' ', ' '.join(page.parts)).strip()
+                  blocked = any(x in (page.title + ' ' + visible[:3000]).lower() for x in (
+                      'access denied', 'verify you are human', 'just a moment',
+                      'checking your browser', 'potwierdz, ze jestes czlowiekiem',
+                      'potwierdź, że jesteś człowiekiem', 'captcha',
+                  ))
+                  links = []
+                  for href in page.links:
+                      full = urllib.parse.urljoin(final_url, href)
+                      if urllib.parse.urlparse(full).hostname != urllib.parse.urlparse(url).hostname:
+                          continue
+                      if 'pokemon' not in urllib.parse.unquote(full).lower():
+                          continue
+                      # Keep public product paths only, never query strings.
+                      public_path = full.split('?', 1)[0].split('#', 1)[0]
+                      if public_path not in links:
+                          links.append(public_path)
+                  details = {
+                      'title': page.title[:250],
+                      'visible_characters': len(visible),
+                      'json_ld_blocks': source.lower().count('application/ld+json'),
+                      'etb_in_title': '30th' in page.title.lower() and ('elite trainer box' in page.title.lower() or 'etb' in page.title.lower()),
+                      'etb_links': [x for x in links if '30th' in x.lower() and 'elite' in x.lower()],
+                      'pokemon_links': links[:25],
+                      'empty_result_markers': [x for x in (
+                          'brak wyników', 'nie znaleziono', 'nie znaleźliśmy', '0 produktów',
+                      ) if x in visible.lower()],
+                  }
+                  status = 'strona weryfikacyjna / blokada' if blocked else ('HTTP 200; rozpoznano strone/link ETB' if details['etb_links'] or details['etb_in_title'] else 'HTTP 200; HTML wymaga sprawdzenia')
+                  return name, status, details
+              except urllib.error.HTTPError as error:
+                  return name, 'HTTP ' + str(error.code) + ' - nie udalo sie odczytac strony', {}
+              except Exception as error:
+                  return name, 'blad polaczenia: ' + type(error).__name__, {}
+
+          token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+          chat_id = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+          if not token or not chat_id.isdecimal() or int(chat_id) <= 0:
+              raise SystemExit('Sprawdz sekrety TELEGRAM_BOT_TOKEN i TELEGRAM_CHAT_ID.')
+          with ThreadPoolExecutor(max_workers=4) as pool:
+              results = list(pool.map(inspect, shops))
+          for name, status, details in results:
+              print(json.dumps({'shop': name, 'status': status, 'details': details}, ensure_ascii=False))
+          message = 'Pokemon Monitor - test 20 sklepow z GitHuba\n\n'
+          message += '\n'.join(name + ': ' + status for name, status, _ in results)
+          message += '\n\nTo test dostepu, nie wynik dostepnosci ETB. Monitoring cykliczny nie jest jeszcze uruchomiony.'
+          payload = json.dumps({'chat_id': chat_id, 'text': message}).encode('utf-8')
+          request = urllib.request.Request(
+              'https://api.telegram.org/bot' + token + '/sendMessage',
+              data=payload, headers={'Content-Type': 'application/json'}, method='POST',
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  if not json.load(response).get('ok'):
+                      raise ValueError()
+          except Exception:
+              raise SystemExit('Test zakonczony; wysylka Telegram nie powiodla sie. Wyniki sa w logu.') from None
+          print('Wynik testu wyslany na Telegram. Zielony status oznacza wykonanie testu, nie dostep do wszystkich sklepow.')
